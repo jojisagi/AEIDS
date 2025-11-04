@@ -1,0 +1,4 @@
+hostname=200.13.89.10
+port=1521
+service_name=pdbcib.lci.ulsa.mx
+mongodb_url=mongodb+srv://usuario:usuario@cluster0.e3vm2.mongodb.net/
