@@ -1,3 +1,0 @@
-# ProyectoAEIDS
-# ProyectoJD
-# ProyectoJD
