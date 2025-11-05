@@ -1,6 +1,6 @@
 # controller/db_facade.py
 from __future__ import annotations
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from model.oracle_model import OracleDB
 from model.repositories import (
@@ -18,9 +18,9 @@ from controller.catalogos_controller import CatalogosControlador
 class DBFacade:
     """
     Fachada para la UI.
-    - Normaliza catálogos a: dict[int, str] (id -> nombre).
-    - Incluye helpers para alta de estado y normalización de colonia/CP.
-    - Métodos tolerantes a backends incompletos (fallback directo con SQL).
+    - Normaliza catálogos (nombres limpios sin prefijos numéricos).
+    - Mapea dinámicamente la tabla/columnas de CLIENTE (soporta CLIENTE/CLIENTES/etc.).
+    - Tiene fallbacks para obtener cve_cliente desde la orden aunque el controlador no lo exponga.
     """
 
     # ========================== Init / Wiring ==========================
@@ -60,30 +60,23 @@ class DBFacade:
 
     @staticmethod
     def _clean_display_name(txt: str) -> str:
-        """
-        Limpia nombres que vienen como '1 Computadora' o '01 - Computadora'
-        para que el UI muestre solo 'Computadora'.
-        """
         s = (txt or "").strip()
-        # quita prefijos numéricos y separadores comunes
         while True:
             orig = s
-            # elimina 'NN - ' o 'NN ' al inicio
-            if len(s) >= 2 and s[0].isdigit():
-                i = 0
-                while i < len(s) and s[i].isdigit():
-                    i += 1
-                # espacios / guiones / puntos tras el número
-                while i < len(s) and s[i] in " .-_/|:":
-                    i += 1
-                s = s[i:].lstrip()
+            i = 0
+            while i < len(s) and s[i].isdigit():
+                i += 1
+            j = i
+            while j < len(s) and s[j] in " .-_/|:":
+                j += 1
+            if j > 0:
+                s = s[j:].lstrip()
             s = s.strip()
             if s == orig:
                 break
         return s
 
     def _id_name_from_value(self, v) -> str:
-        """Extrae texto de nombre desde múltiples formatos (tuplas/listas/dicts)."""
         if isinstance(v, (list, tuple)):
             if len(v) > 1 and isinstance(v[1], (str, bytes)):
                 return self._clean_display_name(self._str_clean(v[1]))
@@ -102,15 +95,10 @@ class DBFacade:
         return self._clean_display_name(self._str_clean(v))
 
     def _normalize_catalog(self, raw) -> Dict[int, str]:
-        """
-        Convierte dict/list/tuplas/dicts a {id:int -> nombre:str}.
-        También invierte diccionarios {nombre->id} si es necesario.
-        """
         out: dict[int, str] = {}
         if raw is None:
             return out
 
-        # dict
         if isinstance(raw, dict):
             for k, v in raw.items():
                 if self._intish(k):
@@ -122,7 +110,6 @@ class DBFacade:
                     out[-abs(hash((k, name))) % (10**8)] = name
             return out
 
-        # list/tuple
         if isinstance(raw, (list, tuple)):
             for it in raw:
                 if isinstance(it, (list, tuple)) and len(it) >= 2:
@@ -167,7 +154,6 @@ class DBFacade:
         out[-abs(hash(str(raw))) % (10**8)] = self._id_name_from_value(raw)
         return out
 
-    # -------- tipos normalizado a {id: (tarifa, nombre)} ----------
     def _normalize_tipos(self, raw) -> dict[int, tuple[float, str]]:
         out: dict[int, tuple[float, str]] = {}
         if not raw:
@@ -177,17 +163,21 @@ class DBFacade:
             tarifa: float = 0.0
             nombre: str = ""
             if isinstance(v, (list, tuple)):
-                # intenta [tarifa, nombre] o [id?, nombre, tarifa]
                 nums = [x for x in v if isinstance(x, (int, float)) or str(x).replace('.', '', 1).isdigit()]
                 txts = [x for x in v if isinstance(x, str)]
                 if txts:
                     nombre = self._clean_display_name(txts[-1])
                 if nums:
-                    tarifa = float(nums[-1])
+                    try:
+                        tarifa = float(nums[-1])
+                    except Exception:
+                        tarifa = 0.0
             elif isinstance(v, dict):
                 if "tarifa" in v and v["tarifa"] is not None:
-                    try: tarifa = float(v["tarifa"])
-                    except Exception: tarifa = 0.0
+                    try:
+                        tarifa = float(v["tarifa"])
+                    except Exception:
+                        tarifa = 0.0
                 for k in ("nombre", "descripcion", "tipo"):
                     if k in v and v[k]:
                         nombre = self._clean_display_name(str(v[k]))
@@ -205,21 +195,17 @@ class DBFacade:
                 elif self._intish(v):
                     out[int(str(v).strip())] = _pair(k)
         else:
-            # lista de pares / dicts
             for it in (raw or []):
                 if isinstance(it, (list, tuple)) and len(it) >= 2 and self._intish(it[0]):
                     out[int(str(it[0]).strip())] = _pair(it[1])
                 elif isinstance(it, dict):
-                    # busca id y nombre
-                    id_keys = ("id", "cve_tipo_equipo", "cve_tipo")
                     _id = None
-                    for kk in id_keys:
+                    for kk in ("id", "cve_tipo_equipo", "cve_tipo"):
                         if kk in it and self._intish(it[kk]):
                             _id = int(str(it[kk]).strip())
                             break
                     if _id is not None:
                         out[_id] = _pair(it)
-
         return out
 
     # ============================ Conexión =============================
@@ -240,10 +226,6 @@ class DBFacade:
         return self._orden.tecnicos_orden(cve_orden, horas)
 
     def actualizar_orden(self, cve_orden: int, **kwargs):
-        """
-        Acepta: cve_status, eq_marca, eq_modelo, cve_tipo_equipo,
-                notas_cliente, cve_taller, cve_tecnico
-        """
         return self._orden.m.actualizar(
             int(cve_orden),
             marca=str(kwargs.get("eq_marca", "") or ""),
@@ -289,23 +271,56 @@ class DBFacade:
         return self._servicio.eliminar(cve_orden_servicio)
 
     # ============================== Cliente ===========================
-    def insertar_cliente_y_verificar_datos(self, *args, **kwargs):
-        return self._cliente.insertar_y_verificar(*args, **kwargs)
 
-    # --------- Column map dinámico para CLIENTE (evita ORA-00904) -----
+    # ---- detección flexible de tabla CLIENTE ----
     def _cliente_colmap(self) -> dict:
         """
-        Lee USER_TAB_COLUMNS para mapear nombres canónicos -> columna real.
-        { 'nombre': 'NOMBRE', 'num_calle': 'NO_CALLE', ... }
+        Detecta la tabla que contiene a CLIENTE (CLIENTE / CLIENTES / CUSTOMER ...),
+        y mapea columnas canónicas -> reales. Devuelve, además:
+           {'_table': 'CLIENTE', 'pk':'CVE_CLIENTE', 'nombre':'NOMBRE', ...}
         """
         conn = self._db.get_connection()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT UPPER(column_name) FROM user_tab_columns WHERE UPPER(table_name)='CLIENTE'"
-        )
-        cols = {r[0] for r in cur.fetchall() or []}
+        try:
+            cur.execute(
+                "SELECT UPPER(table_name), UPPER(column_name) "
+                "FROM user_tab_columns"
+            )
+            rows = cur.fetchall() or []
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
-        def pick(*cands):
+        # Agrupa columnas por tabla
+        by_table: dict[str, set[str]] = {}
+        for t, c in rows:
+            by_table.setdefault(t, set()).add(c)
+
+        # Candidatas por nombre
+        candidates = []
+        for tname, cols in by_table.items():
+            if any(x in tname for x in ("CLIENT", "CUSTOMER", "PERSONA", "USUARIO")):
+                candidates.append((tname, cols))
+
+        # Si no detectamos por nombre, toma la tabla con más "pistas"
+        score_keys = {"NOMBRE", "PATERNO", "MATERNO", "EMAIL", "CORREO", "TELEFONO", "CALLE", "NUM", "NO_CALLE"}
+        if not candidates:
+            for tname, cols in by_table.items():
+                score = sum(1 for k in score_keys if any(col.startswith(k) or k in col for col in cols))
+                if score >= 3:
+                    candidates.append((tname, cols))
+
+        # Elige la mejor
+        table_name = "CLIENTE"
+        table_cols: set[str] = by_table.get("CLIENTE", set())
+        if candidates:
+            # prioriza tablas con más columnas relevantes
+            candidates.sort(key=lambda x: -len(x[1] & score_keys))
+            table_name, table_cols = candidates[0]
+
+        def pick(cols: set[str], *cands) -> Optional[str]:
             for c in cands:
                 uc = c.upper()
                 if uc in cols:
@@ -313,37 +328,78 @@ class DBFacade:
             return None
 
         return {
-            "pk":        pick("CVE_CLIENTE", "ID", "CLIENTE_ID"),
-            "nombre":    pick("NOMBRE"),
-            "paterno":   pick("PATERNO", "APELLIDO_PATERNO", "APE_PAT", "AP_PATERNO"),
-            "materno":   pick("MATERNO", "APELLIDO_MATERNO", "APE_MAT", "AP_MATERNO"),
-            "correo":    pick("CORREO", "EMAIL", "E_MAIL"),
-            "telefono":  pick("TELEFONO", "TEL", "PHONE"),
-            "calle":     pick("CALLE", "DIRECCION", "DOMICILIO", "DIRECCION1"),
-            "num_calle": pick("NUM_CALLE", "NO_CALLE", "NUMERO", "NUMERO_CALLE", "NRO_CALLE"),
+            "_table":   table_name,
+            "pk":        pick(table_cols, "CVE_CLIENTE", "ID", "CLIENTE_ID"),
+            "nombre":    pick(table_cols, "NOMBRE", "NOM_CLIENTE", "NOMBRE_CLIENTE"),
+            "paterno":   pick(table_cols, "PATERNO", "APELLIDO_PATERNO", "APE_PAT", "AP_PATERNO"),
+            "materno":   pick(table_cols, "MATERNO", "APELLIDO_MATERNO", "APE_MAT", "AP_MATERNO"),
+            "correo":    pick(table_cols, "CORREO", "EMAIL", "E_MAIL"),
+            "telefono":  pick(table_cols, "TELEFONO", "TEL", "PHONE"),
+            "calle":     pick(table_cols, "CALLE", "DIRECCION", "DOMICILIO", "DIRECCION1"),
+            "num_calle": pick(table_cols, "NUM_CALLE", "NO_CALLE", "NUMERO", "NUMERO_CALLE", "NRO_CALLE"),
         }
+
+    def insertar_cliente_y_verificar_datos(self, *args, **kwargs):
+        return self._cliente.insertar_y_verificar(*args, **kwargs)
 
     def cliente_id_por_orden(self, cve_orden: int) -> int | None:
         """
-        Usa el controlador si existe; si no, lee directo.
+        1) Intenta via controlador.
+        2) SELECT directo en ORDEN.
+        3) Fallback: recorre self.ordenes() y toma campo cve_cliente/cliente/id_cliente.
         """
+        # 1) controlador
         try:
             return self._orden.cliente_id_por_orden(int(cve_orden))  # type: ignore[attr-defined]
         except Exception:
+            pass
+
+        # 2) directo
+        try:
             conn = self._db.get_connection()
             cur = conn.cursor()
-            cur.execute("SELECT cve_cliente FROM orden WHERE cve_orden = :o", {"o": int(cve_orden)})
-            row = cur.fetchone()
-            return int(row[0]) if row and row[0] is not None else None
+            try:
+                # nombres comunes
+                cur.execute(
+                    "SELECT cve_cliente FROM orden WHERE cve_orden = :o",
+                    {"o": int(cve_orden)},
+                )
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    return int(row[0])
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3) fallback recorriendo listado en memoria
+        try:
+            for o in self.ordenes() or []:
+                oid = getattr(o, "cve_orden", None) or getattr(o, "id", None)
+                if oid is not None and int(oid) == int(cve_orden):
+                    for k in ("cve_cliente", "cliente", "id_cliente"):
+                        v = getattr(o, k, None) if not isinstance(o, dict) else o.get(k)
+                        if v is not None:
+                            try:
+                                return int(v)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        return None
 
     def actualizar_cliente(self, cve_cliente: int, **kwargs):
         """
-        UPDATE flexible que usa los nombres reales de columnas en CLIENTE.
+        UPDATE flexible que usa los nombres reales de columnas y tabla detectada.
         Acepta: nombre, paterno, materno, correo, telefono, calle, num_calle
         """
         cmap = self._cliente_colmap()
+        table = cmap.get("_table") or "CLIENTE"
         if not cmap.get("pk"):
-            raise RuntimeError("No se encontró la PK de CLIENTE.")
+            raise RuntimeError("No se encontró la PK de la tabla de CLIENTE.")
 
         fields = {
             "nombre":    kwargs.get("nombre"),
@@ -352,7 +408,7 @@ class DBFacade:
             "correo":    kwargs.get("correo"),
             "telefono":  kwargs.get("telefono"),
             "calle":     kwargs.get("calle"),
-            "num_calle": kwargs.get("num_calle"),
+            "num_calle": kwargs.get("num_calle") or kwargs.get("numero"),
         }
 
         sets, binds = [], {"IDVAL": int(cve_cliente)}
@@ -363,20 +419,22 @@ class DBFacade:
                 binds[canonical] = value
 
         if not sets:
-            return 0  # nada que actualizar
+            return 0
 
-        sql = f"UPDATE CLIENTE SET {', '.join(sets)} WHERE {cmap['pk']} = :IDVAL"
+        sql = f'UPDATE {table} SET {", ".join(sets)} WHERE {cmap["pk"]} = :IDVAL'
         conn = self._db.get_connection()
         cur = conn.cursor()
-        cur.execute(sql, binds)
-        return cur.rowcount or 0
+        try:
+            cur.execute(sql, binds)
+            return cur.rowcount or 0
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     # ======= Catálogos (normalizados) y directos a tablas =========
     def tipos(self) -> dict[int, tuple[float, str]]:
-        """
-        Devuelve {id: (tarifa, nombre)}. El nombre viene limpio para UI
-        (p.ej., 'Computadora' sin prefijos numéricos).
-        """
         raw = self._catalogos.tipos()
         return self._normalize_tipos(raw)
 
@@ -397,8 +455,10 @@ class DBFacade:
             rows = cur.fetchall() or []
             return {int(r[0]): (r[1] or "") for r in rows}
         finally:
-            try: cur.close()
-            except Exception: pass
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def estados(self, pais) -> dict[int, str]:
         try:
@@ -415,8 +475,10 @@ class DBFacade:
             rows = cur.fetchall() or []
             return {int(r[0]): (r[1] or "") for r in rows}
         finally:
-            try: cur.close()
-            except Exception: pass
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     # ===================== Helpers: estado/colonia ====================
     def upsert_estado(self, pais: int | str, nombre: str) -> int | None:
@@ -434,36 +496,42 @@ class DBFacade:
         nombre_clean = str(nombre).strip()
         nombre_key = nombre_clean.lower()
 
-        cur.execute(
-            "SELECT cve_estado FROM estado "
-            "WHERE cve_pais = :p AND LOWER(TRIM(estado)) = :n FETCH FIRST 1 ROWS ONLY",
-            {"p": pais_id, "n": nombre_key},
-        )
-        row = cur.fetchone()
-        if row:
-            return int(row[0])
-
         try:
             cur.execute(
-                "INSERT INTO estado (cve_estado, cve_pais, estado) "
-                "VALUES (estado_cve_estado_seq.NEXTVAL, :p, :n)",
-                {"p": pais_id, "n": nombre_clean},
-            )
-            cur.execute("SELECT estado_cve_estado_seq.CURRVAL FROM dual")
-            return int(cur.fetchone()[0])
-        except Exception:
-            cur.execute(
-                "INSERT INTO estado (cve_pais, estado) VALUES (:p, :n)",
-                {"p": pais_id, "n": nombre_clean},
-            )
-            cur.execute(
                 "SELECT cve_estado FROM estado "
-                "WHERE cve_pais = :p AND LOWER(TRIM(estado)) = :n "
-                "ORDER BY cve_estado DESC FETCH FIRST 1 ROWS ONLY",
+                "WHERE cve_pais = :p AND LOWER(TRIM(estado)) = :n FETCH FIRST 1 ROWS ONLY",
                 {"p": pais_id, "n": nombre_key},
             )
-            row2 = cur.fetchone()
-            return int(row2[0]) if row2 else None
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
+
+            try:
+                cur.execute(
+                    "INSERT INTO estado (cve_estado, cve_pais, estado) "
+                    "VALUES (estado_cve_estado_seq.NEXTVAL, :p, :n)",
+                    {"p": pais_id, "n": nombre_clean},
+                )
+                cur.execute("SELECT estado_cve_estado_seq.CURRVAL FROM dual")
+                return int(cur.fetchone()[0])
+            except Exception:
+                cur.execute(
+                    "INSERT INTO estado (cve_pais, estado) VALUES (:p, :n)",
+                    {"p": pais_id, "n": nombre_clean},
+                )
+                cur.execute(
+                    "SELECT cve_estado FROM estado "
+                    "WHERE cve_pais = :p AND LOWER(TRIM(estado)) = :n "
+                    "ORDER BY cve_estado DESC FETCH FIRST 1 ROWS ONLY",
+                    {"p": pais_id, "n": nombre_key},
+                )
+                r2 = cur.fetchone()
+                return int(r2[0]) if r2 else None
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def resolve_or_create_colonia(
         self,
@@ -484,91 +552,102 @@ class DBFacade:
         nombre_key = nombre_clean.lower()
 
         if not cp_clean:
+            try:
+                cur.close()
+            except Exception:
+                pass
             return None
 
-        cur.execute(
-            "SELECT cve_cp FROM cp WHERE cp = :cp FETCH FIRST 1 ROWS ONLY",
-            {"cp": cp_clean},
-        )
-        row = cur.fetchone()
-        if row:
-            cve_cp = int(row[0])
-        else:
-            cve_municipio = None
-            if municipio and estado:
-                cur.execute(
-                    "SELECT cve_municipio FROM municipio "
-                    "WHERE cve_estado = :e AND LOWER(TRIM(municipio)) = :m "
-                    "FETCH FIRST 1 ROWS ONLY",
-                    {"e": int(estado), "m": str(municipio).strip().lower()},
-                )
-                r2 = cur.fetchone()
-                if r2:
-                    cve_municipio = int(r2[0])
+        try:
+            cur.execute(
+                "SELECT cve_cp FROM cp WHERE cp = :cp FETCH FIRST 1 ROWS ONLY",
+                {"cp": cp_clean},
+            )
+            row = cur.fetchone()
+            if row:
+                cve_cp = int(row[0])
+            else:
+                cve_municipio = None
+                if municipio and estado:
+                    cur.execute(
+                        "SELECT cve_municipio FROM municipio "
+                        "WHERE cve_estado = :e AND LOWER(TRIM(municipio)) = :m "
+                        "FETCH FIRST 1 ROWS ONLY",
+                        {"e": int(estado), "m": str(municipio).strip().lower()},
+                    )
+                    r2 = cur.fetchone()
+                    if r2:
+                        cve_municipio = int(r2[0])
 
-            if cve_municipio is None:
-                return None
+                if cve_municipio is None:
+                    return None
+
+                cur.execute(
+                    "INSERT INTO cp (cve_cp, cp, cve_municipio) "
+                    "VALUES (cp_cve_cp_seq.NEXTVAL, :cp, :mun)",
+                    {"cp": cp_clean, "mun": cve_municipio},
+                )
+                cur.execute("SELECT cp_cve_cp_seq.CURRVAL FROM dual")
+                cve_cp = int(cur.fetchone()[0])
 
             cur.execute(
-                "INSERT INTO cp (cve_cp, cp, cve_municipio) "
-                "VALUES (cp_cve_cp_seq.NEXTVAL, :cp, :mun)",
-                {"cp": cp_clean, "mun": cve_municipio},
+                "SELECT cve_colonia FROM colonia "
+                "WHERE cve_cp = :cp AND LOWER(TRIM(colonia)) = :n FETCH FIRST 1 ROWS ONLY",
+                {"cp": cve_cp, "n": nombre_key},
             )
-            cur.execute("SELECT cp_cve_cp_seq.CURRVAL FROM dual")
-            cve_cp = int(cur.fetchone()[0])
+            r3 = cur.fetchone()
+            if r3:
+                return int(r3[0])
 
-        cur.execute(
-            "SELECT cve_colonia FROM colonia "
-            "WHERE cve_cp = :cp AND LOWER(TRIM(colonia)) = :n FETCH FIRST 1 ROWS ONLY",
-            {"cp": cve_cp, "n": nombre_key},
-        )
-        r3 = cur.fetchone()
-        if r3:
-            return int(r3[0])
-
-        cur.execute(
-            "INSERT INTO colonia (cve_colonia, colonia, cve_cp) "
-            "VALUES (colonia_cve_colonia_seq.NEXTVAL, :n, :cp)",
-            {"n": nombre_clean, "cp": cve_cp},
-        )
-        cur.execute("SELECT colonia_cve_colonia_seq.CURRVAL FROM dual")
-        return int(cur.fetchone()[0])
+            cur.execute(
+                "INSERT INTO colonia (cve_colonia, colonia, cve_cp) "
+                "VALUES (colonia_cve_colonia_seq.NEXTVAL, :n, :cp)",
+                {"n": nombre_clean, "cp": cve_cp},
+            )
+            cur.execute("SELECT colonia_cve_colonia_seq.CURRVAL FROM dual")
+            return int(cur.fetchone()[0])
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     # ================ Cliente: helpers y operaciones UI ================
     def cliente_detalle(self, cve_cliente: int) -> dict | None:
         """
-        Lee directo desde CLIENTE usando mapeo de columnas para
-        devolver solo los campos que usa la UI.
+        Lee usando mapeo de tabla/columnas detectado.
+        Devuelve solo los campos que usa la UI.
         """
         cmap = self._cliente_colmap()
+        table = cmap.get("_table") or "CLIENTE"
         if not cmap.get("pk"):
             return None
 
-        select_cols = [cmap[k] for k in ("nombre","paterno","materno","correo","telefono","calle","num_calle") if cmap.get(k)]
+        wanted = ("nombre", "paterno", "materno", "correo", "telefono", "calle", "num_calle")
+        select_cols = [cmap[k] for k in wanted if cmap.get(k)]
         if not select_cols:
             return None
 
-        sql = f"SELECT {', '.join(select_cols)} FROM CLIENTE WHERE {cmap['pk']} = :IDVAL"
+        sql = f"SELECT {', '.join(select_cols)} FROM {table} WHERE {cmap['pk']} = :IDVAL"
         conn = self._db.get_connection()
         cur = conn.cursor()
-        cur.execute(sql, {"IDVAL": int(cve_cliente)})
-        row = cur.fetchone()
-        if not row:
-            return None
-
-        keys = [k for k in ("nombre","paterno","materno","correo","telefono","calle","num_calle") if cmap.get(k)]
-        return {k: (row[i] if row[i] is not None else "") for i, k in enumerate(keys)}
+        try:
+            cur.execute(sql, {"IDVAL": int(cve_cliente)})
+            row = cur.fetchone()
+            if not row:
+                return None
+            keys = [k for k in wanted if cmap.get(k)]
+            return {k: (row[i] if row[i] is not None else "") for i, k in enumerate(keys)}
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def guardar_cliente_de_orden(self, cve_orden: int, *args, **kwargs) -> int | None:
         """
         Inserta/actualiza el cliente vinculado a una orden.
-        Acepta posicionales (en este orden):
-          [nombre, paterno, materno, correo, telefono, calle, num_calle,
-           cp5, colonia, municipio, estado, pais]
-        o keywords con esos nombres.
-        Devuelve cve_cliente.
         """
-        # ------ mapear args -> kwargs ------
         arg_names = [
             "nombre", "paterno", "materno", "correo", "telefono",
             "calle", "num_calle", "cp5", "colonia", "municipio", "estado", "pais",
@@ -577,36 +656,32 @@ class DBFacade:
             if i < len(arg_names) and arg_names[i] not in kwargs:
                 kwargs[arg_names[i]] = v
 
-        # normalizar
-        nombre   = self._str_clean(kwargs.get("nombre"))
-        paterno  = self._str_clean(kwargs.get("paterno"))
-        materno  = self._str_clean(kwargs.get("materno"))
-        correo   = self._str_clean(kwargs.get("correo"))
-        telefono = self._str_clean(kwargs.get("telefono"))
-        calle    = self._str_clean(kwargs.get("calle"))
-        num_calle= self._str_clean(kwargs.get("num_calle"))
-        cp5      = self._str_clean(kwargs.get("cp5"))
-        colonia  = self._str_clean(kwargs.get("colonia"))
-        municipio= self._str_clean(kwargs.get("municipio"))
-        estado   = self._str_clean(kwargs.get("estado"))
-        pais     = kwargs.get("pais")
+        nombre    = self._str_clean(kwargs.get("nombre"))
+        paterno   = self._str_clean(kwargs.get("paterno"))
+        materno   = self._str_clean(kwargs.get("materno"))
+        correo    = self._str_clean(kwargs.get("correo"))
+        telefono  = self._str_clean(kwargs.get("telefono"))
+        calle     = self._str_clean(kwargs.get("calle"))
+        num_calle = self._str_clean(kwargs.get("num_calle") or kwargs.get("numero"))
+        cp5       = self._str_clean(kwargs.get("cp5"))
+        colonia   = self._str_clean(kwargs.get("colonia"))
+        municipio = self._str_clean(kwargs.get("municipio"))
+        estado    = self._str_clean(kwargs.get("estado"))
+        pais      = kwargs.get("pais")
 
         if not nombre or not paterno:
             raise ValueError("nombre y paterno son obligatorios")
 
-        # buscar cliente ya ligado a la orden
         cve_cliente = self.cliente_id_por_orden(int(cve_orden))
 
-        # upsert estado si nos dieron nombre (pais debe existir)
         cve_estado = None
         if estado:
             cve_estado = self.upsert_estado(pais or 1, estado)
 
-        # (opcional) normalizar colonia/cp
-        _ = self.resolve_or_create_colonia(cp5, colonia, municipio, cve_estado, pais) if cp5 and colonia else None
+        if cp5 and colonia:
+            _ = self.resolve_or_create_colonia(cp5, colonia, municipio, cve_estado, pais)
 
         if cve_cliente:
-            # actualizar
             self.actualizar_cliente(
                 int(cve_cliente),
                 nombre=nombre, paterno=paterno, materno=materno,
@@ -615,17 +690,22 @@ class DBFacade:
             )
             return int(cve_cliente)
 
-        # insertar y re-vincular a la orden
         new_id = self.insertar_cliente_y_verificar_datos(
             nombre, paterno, materno, correo, telefono,
             calle, num_calle, cp5, colonia, municipio, estado, pais
         )
         conn = self._db.get_connection()
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE orden SET cve_cliente = :cli WHERE cve_orden = :ord",
-            {"cli": int(new_id), "ord": int(cve_orden)},
-        )
+        try:
+            cur.execute(
+                "UPDATE orden SET cve_cliente = :cli WHERE cve_orden = :ord",
+                {"cli": int(new_id), "ord": int(cve_orden)},
+            )
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
         return int(new_id)
 
     # ============================== Misc ==============================

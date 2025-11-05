@@ -9,152 +9,201 @@ if not hasattr(ft, "icons") and hasattr(ft, "Icons"):
     ft.icons = ft.Icons
 
 
-# -------- utilidades suaves --------
-def _get(obj, keys, default=""):
+# ---------------- utilidades ----------------
+def _from_sources(sources, keys, default: str = "") -> str:
     """
-    Obtiene atributo/campo usando varias claves:
-    - dict: prioriza claves exactas
-    - objeto: prioriza atributos
+    Busca un valor en una o varias fuentes (dict/obj) usando una lista de claves posibles.
+    Devuelve siempre str (o default).
     """
-    for k in keys:
-        if isinstance(obj, dict) and k in obj:
-            v = obj.get(k)
-            return "" if v is None else v
-        if hasattr(obj, k):
-            v = getattr(obj, k)
-            return "" if v is None else v
+    srcs = sources if isinstance(sources, (list, tuple)) else [sources]
+    for src in srcs:
+        if src is None:
+            continue
+        for k in keys:
+            if isinstance(src, dict) and k in src:
+                v = src.get(k)
+                return "" if v is None else str(v)
+            if hasattr(src, k):
+                v = getattr(src, k)
+                return "" if v is None else str(v)
     return default
 
 
-def _call_first_if_present(target, names: list[str], *args, **kwargs):
-    """
-    Busca el primer método en 'names' que exista en target y lo llama.
-    Devuelve (ok:bool, retorno:any|None, nombre_usado:str|None)
-    """
-    for n in names:
-        if hasattr(target, n):
-            try:
-                return True, getattr(target, n)(*args, **kwargs), n
-            except TypeError:
-                # Reintenta pasando todo como kwargs "amplios" si el método admite **kwargs
-                try:
-                    return True, getattr(target, n)(**kwargs), n
-                except Exception:
-                    pass
-            except Exception:
-                pass
-    return False, None, None
+def _kv(label: str, value: str) -> ft.Control:
+    return ft.Row(
+        [ft.Text(label, weight=ft.FontWeight.BOLD, width=140), ft.Text(value or "—")],
+        alignment=ft.MainAxisAlignment.START,
+    )
 
 
-# -------------------------------------------------
-# Diálogo: editar cliente (como en tu simple_view.py)
-# -------------------------------------------------
+# ---------------- diálogo principal ----------------
 def open_editar_cliente_dialog(
     page: ft.Page,
     db_instance,
-    cliente_obj,           # dict/obj del cliente actual
-    cve_orden: int | str,  # se muestra en el título, por contexto
+    cliente_obj,            # dict/obj opcional que venga de la UI (puede ser None)
+    cve_orden: int | str,   # id de la orden para cargar el cliente real
     on_saved=None,
 ):
-    # Campos existentes del cliente (tolerantes a nombres)
-    tf_nombre  = ft.TextField(label="Nombre",      value=_get(cliente_obj, ["nombre", "nom", "name"]))
-    tf_pat     = ft.TextField(label="Apellido paterno", value=_get(cliente_obj, ["paterno", "ap_paterno", "apellido_paterno"]))
-    tf_mat     = ft.TextField(label="Apellido materno", value=_get(cliente_obj, ["materno", "ap_materno", "apellido_materno"]))
-    tf_correo  = ft.TextField(label="Correo",      value=_get(cliente_obj, ["correo", "email", "mail"]))
-    tf_tel     = ft.TextField(label="Telefono",    value=_get(cliente_obj, ["telefono", "tel", "phone"]))
-    tf_calle   = ft.TextField(label="Calle",       value=_get(cliente_obj, ["dir_calle", "calle"]))
-    tf_numero  = ft.TextField(label="No. Calle",   value=_get(cliente_obj, ["dir_numero", "numero", "num_ext"]))
+    """
+    - Carga el cliente vinculado a la orden (si existe) usando DBFacade.cliente_id_por_orden + cliente_detalle.
+    - Muestra una sección 'Actual (solo lectura)' con los valores vigentes.
+    - Precarga los TextField con esos valores para facilitar la edición.
+    - Guarda con DBFacade.guardar_cliente_de_orden (upsert y re-vinculación).
+    """
 
-    error = ft.Text("", color=ft.colors.RED_300)
+    # ---------- 1) Cargar detalle real desde la BD (si hay cliente ligado) ----------
+    detalle_db: dict = {}
+    try:
+        cli_id = db_instance.cliente_id_por_orden(int(cve_orden))
+        if cli_id:
+            # usa el helper de la fachada que lee directo de la tabla cliente
+            detalle_db = db_instance.cliente_detalle(int(cli_id)) or {}
+    except Exception:
+        detalle_db = {}
+
+    # Fuentes en prioridad: lo que ya trae la UI, luego lo que venga de BD
+    fuentes = [cliente_obj, detalle_db]
+
+    # ---------- 2) Normalizar valores actuales ----------
+    curr_nombre   = _from_sources(fuentes, ["nombre", "name", "nom"])
+    curr_paterno  = _from_sources(fuentes, ["paterno", "ap_paterno", "apellido_paterno"])
+    curr_materno  = _from_sources(fuentes, ["materno", "ap_materno", "apellido_materno"])
+    curr_correo   = _from_sources(fuentes, ["correo", "email", "mail"])
+    curr_tel      = _from_sources(fuentes, ["telefono", "tel", "phone"])
+    curr_calle    = _from_sources(fuentes, ["calle", "dir_calle"])
+    # Nota: si en tu esquema no existe num_calle, simplemente quedará vacío (no lo usamos para guardar)
+    curr_num      = _from_sources(fuentes, ["num_calle", "dir_numero", "numero", "num_ext"])
+
+    # ---------- 3) Campos editables (precargados) ----------
+    tf_nombre  = ft.TextField(label="Nombre",           value=curr_nombre)
+    tf_pat     = ft.TextField(label="Apellido paterno", value=curr_paterno)
+    tf_mat     = ft.TextField(label="Apellido materno", value=curr_materno)
+    tf_correo  = ft.TextField(label="Correo",           value=curr_correo)
+    tf_tel     = ft.TextField(label="Teléfono",         value=curr_tel)
+    tf_calle   = ft.TextField(label="Calle",            value=curr_calle)
+    tf_num     = ft.TextField(label="No. Calle",        value=curr_num)
+
+    # Forzamos una asignación posterior por si el framework no respeta el 'value' inicial en algunos entornos.
+    def _apply_prefill():
+        tf_nombre.value = curr_nombre
+        tf_pat.value    = curr_paterno
+        tf_mat.value    = curr_materno
+        tf_correo.value = curr_correo
+        tf_tel.value    = curr_tel
+        tf_calle.value  = curr_calle
+        tf_num.value    = curr_num
+
+    # ---------- 4) Vista readonly (valores actuales) ----------
+    readonly_box = ft.Container(
+        bgcolor=ft.colors.with_opacity(0.05, ft.colors.ON_SURFACE),
+        padding=12,
+        border_radius=12,
+        content=ft.Column(
+            [
+                ft.Text("Actual (solo lectura)", weight=ft.FontWeight.BOLD),
+                _kv("Nombre:", curr_nombre),
+                _kv("Ap. paterno:", curr_paterno),
+                _kv("Ap. materno:", curr_materno),
+                _kv("Correo:", curr_correo),
+                _kv("Teléfono:", curr_tel),
+                _kv("Calle:", curr_calle),
+                _kv("No. Calle:", curr_num),
+            ],
+            tight=True,
+            spacing=6,
+        ),
+    )
+
+    error_lbl = ft.Text("", color=ft.colors.RED_300)
+    dlg = ft.AlertDialog(modal=True)
 
     def cerrar(_=None):
-        page.dialog.open = False
+        dlg.open = False
         page.update()
 
     def guardar(_=None):
-        # Colecta valores
+        error_lbl.value = ""
+        page.update()
+
         nombre   = (tf_nombre.value or "").strip()
         paterno  = (tf_pat.value or "").strip()
         materno  = (tf_mat.value or "").strip()
         correo   = (tf_correo.value or "").strip()
         telefono = (tf_tel.value or "").strip()
         calle    = (tf_calle.value or "").strip()
-        numero   = (tf_numero.value or "").strip()
+        num_calle= (tf_num.value or "").strip()
 
-        if not nombre or not paterno or not correo:
-            error.value = "Nombre, Ap. Paterno y Correo son obligatorios."
+        if not nombre or not paterno:
+            error_lbl.value = "Nombre y Apellido paterno son obligatorios."
             page.update()
             return
 
-        # Buscamos un método de actualización en la fachada
-        # Ajusta/añade el que uses realmente si no se detecta
-        CANDIDATE_METHODS = [
-            "actualizar_cliente",
-            "update_cliente",
-            "editar_cliente",
-            "cliente_update",
-            "cliente_actualizar",
-            "update",
-        ]
+        try:
+            # Upsert del cliente y re-vinculación a la orden (usa la fachada)
+            db_instance.guardar_cliente_de_orden(
+                int(cve_orden),
+                nombre=nombre,
+                paterno=paterno,
+                materno=materno,
+                correo=correo,
+                telefono=telefono,
+                calle=calle,
+                num_calle=num_calle,
+                # cp5/colonia/municipio/estado/pais son opcionales; omitir si no los manejas aquí
+            )
 
-        payload = dict(
-            nombre=nombre,
-            paterno=paterno,
-            materno=materno,
-            correo=correo,
-            telefono=telefono,
-            calle=calle,
-            numero=numero,
-            # permite id si tu método lo requiere
-            cve_cliente=_get(cliente_obj, ["cve_cliente", "id", "cliente"]),
-        )
-
-        ok, res, used = _call_first_if_present(db_instance, CANDIDATE_METHODS, **payload)
-        if not ok:
-            # Algunos proyectos exponen el controlador/DAO bajo db_instance._cliente
-            if hasattr(db_instance, "_cliente"):
-                ok, res, used = _call_first_if_present(getattr(db_instance, "_cliente"), CANDIDATE_METHODS, **payload)
-
-        if ok:
+            # Commit best-effort
             try:
-                if hasattr(db_instance, "get_connection"):
-                    conn = db_instance.get_connection()
-                    if conn:
-                        conn.commit()
+                conn = db_instance.get_connection()
+                if conn:
+                    conn.commit()
             except Exception:
                 pass
 
-            page.open(ft.SnackBar(ft.Text("Cliente actualizado")))
+            page.open(ft.SnackBar(ft.Text(f"Cliente de la orden #{cve_orden} actualizado")))
             cerrar()
             if callable(on_saved):
                 try:
                     on_saved()
                 except Exception:
                     pass
-        else:
-            error.value = "No se encontró método para actualizar el cliente en la fachada."
+
+        except Exception as ex:
+            try:
+                conn = db_instance.get_connection()
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            error_lbl.value = f"Error al guardar: {ex}"
             page.update()
 
-    dlg = ft.AlertDialog(
-        modal=True,
-        title=ft.Text(f"Editar Cliente Orden #{cve_orden}"),
-        content=ft.Column(
-            controls=[
-                tf_nombre, tf_pat, tf_mat, tf_correo, tf_tel, tf_calle, tf_numero,
-                ft.Container(height=4),
-                error,
-            ],
-            tight=True,
-            scroll=ft.ScrollMode.AUTO,
-        ),
-        actions=[
-            ft.TextButton("Guardar", on_click=guardar),
-            ft.TextButton("Cancelar", on_click=cerrar),
+    dlg.title = ft.Text(f"Editar Cliente Orden #{cve_orden}", weight=ft.FontWeight.BOLD)
+    dlg.content = ft.Column(
+        controls=[
+            error_lbl,
+            readonly_box,
+            ft.Divider(opacity=0.1),
+            ft.Text("Nuevo / editar", weight=ft.FontWeight.BOLD),
+            tf_nombre, tf_pat, tf_mat, tf_correo, tf_tel, tf_calle, tf_num,
         ],
-        actions_alignment=ft.MainAxisAlignment.END,
-        shape=ft.RoundedRectangleBorder(radius=18),
+        tight=True,
+        scroll=ft.ScrollMode.AUTO,
     )
+    dlg.actions = [
+        ft.FilledButton("Guardar", icon=ft.icons.SAVE, on_click=guardar),
+        ft.TextButton("Cancelar", on_click=cerrar),
+    ]
+    dlg.actions_alignment = ft.MainAxisAlignment.END
+    dlg.shape = ft.RoundedRectangleBorder(radius=18)
 
     page.dialog = dlg
     dlg.open = True
+
+    # Aplicamos el prefill por si el constructor no lo mostró.
+    _apply_prefill()
     page.update()
+
+
+# Alias por compatibilidad con otros imports
+open_editar_cliente_de_orden_dialog = open_editar_cliente_dialog

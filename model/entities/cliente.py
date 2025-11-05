@@ -1,295 +1,205 @@
 # view/cliente.py
 from __future__ import annotations
-import re
 import flet as ft
 
-# Compatibilidad Flet
+# Compat Flet
 if not hasattr(ft, "colors") and hasattr(ft, "Colors"):
     ft.colors = ft.Colors
 if not hasattr(ft, "icons") and hasattr(ft, "Icons"):
     ft.icons = ft.Icons
 
-EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
-PHONE_10_RE = re.compile(r"^\d{10}$")
-PHONE_PLUS52_RE = re.compile(r"^\+52\d{10}$")
-HOUSE_RE = re.compile(r"^(?:\d{1,6}(?:[A-Z])?(?:-\d{1,4})?|s/?n)$", re.I)
 
-def _normalize_house(s: str) -> str:
-    s = (s or "").strip().upper().replace(" ", "")
-    s = s.replace("SINNUMERO", "S/N").replace("S/N.", "S/N")
-    if s in ("SN", "S-N"):
-        s = "S/N"
-    return s
+# -------- utilidades suaves --------
+def _get(obj, keys, default=""):
+    """
+    Obtiene atributo/campo usando varias claves:
+    - dict: prioriza claves exactas
+    - objeto: prioriza atributos
+    """
+    if obj is None:
+        return default
+    for k in keys:
+        if isinstance(obj, dict) and k in obj:
+            v = obj.get(k)
+            return "" if v is None else v
+        if hasattr(obj, k):
+            v = getattr(obj, k)
+            return "" if v is None else v
+    return default
 
-def _normalize_phone(s: str) -> str | None:
-    s = (s or "").strip()
-    if PHONE_10_RE.fullmatch(s):
-        return s
-    if PHONE_PLUS52_RE.fullmatch(s):
-        return s[-10:]
-    return None
+
+def _call_first_if_present(target, names: list[str], *args, **kwargs):
+    """
+    Busca el primer método en 'names' que exista en target y lo llama.
+    Devuelve (ok:bool, retorno:any|None, nombre_usado:str|None)
+    """
+    for n in names:
+        if hasattr(target, n):
+            try:
+                return True, getattr(target, n)(*args, **kwargs), n
+            except TypeError:
+                # Reintenta pasando todo como kwargs "amplios" si el método admite **kwargs
+                try:
+                    return True, getattr(target, n)(**kwargs), n
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    return False, None, None
 
 
+def _fetch_cliente_detalle_resistente(db_instance, cve_orden: int):
+    """
+    Intenta obtener el cve_cliente y luego el detalle para precargar.
+    Devuelve {} si no se pudo.
+    """
+    try:
+        cve_cli = db_instance.cliente_id_por_orden(int(cve_orden))
+    except Exception:
+        cve_cli = None
+
+    if not cve_cli:
+        return {}
+
+    # Camino 1: método de la fachada
+    try:
+        data = db_instance.cliente_detalle(int(cve_cli)) or {}
+        if isinstance(data, dict) and any((str(v).strip() for v in data.values() if v is not None)):
+            return data
+    except Exception:
+        pass
+
+    # Camino 2: si expone un controlador interno
+    try:
+        if hasattr(db_instance, "_cliente") and hasattr(db_instance._cliente, "detalle"):
+            data = db_instance._cliente.detalle(int(cve_cli)) or {}
+            if isinstance(data, dict) and any((str(v).strip() for v in data.values() if v is not None)):
+                return data
+    except Exception:
+        pass
+
+    # Si nada funcionó:
+    return {}
+
+
+# -------------------------------------------------
+# Diálogo: editar cliente (precarga con fallback)
+# -------------------------------------------------
 def open_editar_cliente_dialog(
     page: ft.Page,
     db_instance,
-    cliente_ref: dict | object | str | int | None,
-    cve_orden: int | None = None,
-    on_saved: callable | None = None,
+    cliente_obj,           # puede venir dict, objeto o incluso None
+    cve_orden: int | str,  # se usa para autoconseguir el cliente si falta
+    on_saved=None,
 ):
-    """
-    Dialog para editar un cliente. `cliente_ref` puede ser:
-      - id de cliente
-      - dict/objeto con campos
-      - string (ignoramos y tratamos de leer por `cve_orden`)
-    Si se proporciona `cve_orden`, intentamos leer el cliente de la orden.
-    """
-    # --------- Cargar datos actuales ----------
-    detalle = None
-    if cve_orden is not None:
-        try:
-            detalle = db_instance.cliente_de_orden(int(cve_orden))
-        except Exception:
-            detalle = None
+    # --- asegurar datos precargados ---
+    cve_orden_int = int(str(cve_orden))
+    if not (isinstance(cliente_obj, dict) and any((str(v).strip() for v in cliente_obj.values() if v is not None))):
+        # si llega vacío, buscar directamente en DB con la orden
+        cliente_obj = _fetch_cliente_detalle_resistente(db_instance, cve_orden_int)
 
-    if detalle is None and cliente_ref is not None:
-        if isinstance(cliente_ref, int) or (isinstance(cliente_ref, str) and cliente_ref.isdigit()):
-            detalle = db_instance.cliente_por_id(int(cliente_ref))
-        elif isinstance(cliente_ref, dict):
-            detalle = cliente_ref
-        else:
-            # objeto con atributos comunes
-            detalle = {
-                "cve_cliente": getattr(cliente_ref, "cve_cliente", None),
-                "nombre": getattr(cliente_ref, "nombre", ""),
-                "paterno": getattr(cliente_ref, "paterno", ""),
-                "materno": getattr(cliente_ref, "materno", ""),
-                "correo": getattr(cliente_ref, "correo", ""),
-                "telefono": getattr(cliente_ref, "telefono", ""),
-                "calle": getattr(cliente_ref, "calle", ""),
-                "numero": getattr(cliente_ref, "numero", ""),
-                "cp": getattr(cliente_ref, "cp", ""),
-                "colonia": getattr(cliente_ref, "colonia", ""),
-                "municipio": getattr(cliente_ref, "municipio", ""),
-                "estado": getattr(cliente_ref, "estado", ""),
-                "pais": getattr(cliente_ref, "pais", ""),
-            }
+    # Campos existentes del cliente (tolerantes a nombres)
+    tf_nombre  = ft.TextField(label="Nombre",             value=_get(cliente_obj, ["nombre", "nom", "name"]))
+    tf_pat     = ft.TextField(label="Apellido paterno",   value=_get(cliente_obj, ["paterno", "ap_paterno", "apellido_paterno"]))
+    tf_mat     = ft.TextField(label="Apellido materno",   value=_get(cliente_obj, ["materno", "ap_materno", "apellido_materno"]))
+    tf_correo  = ft.TextField(label="Correo",             value=_get(cliente_obj, ["correo", "email", "mail"]))
+    tf_tel     = ft.TextField(label="Teléfono",           value=_get(cliente_obj, ["telefono", "tel", "phone"]))
+    tf_calle   = ft.TextField(label="Calle",              value=_get(cliente_obj, ["calle", "dir_calle", "direccion", "domicilio", "direccion1"]))
+    tf_numero  = ft.TextField(label="No. Calle",          value=_get(cliente_obj, ["num_calle", "no_calle", "numero", "num_ext", "numero_calle"]))
 
-    if detalle is None:
-        page.open(ft.SnackBar(ft.Text("No fue posible obtener los datos del cliente.")))
-        return
-
-    # extrae valores con tolerancia
-    def gv(d, *keys, default=""):
-        if isinstance(d, dict):
-            for k in keys:
-                if k in d:
-                    return d[k]
-        for k in keys:
-            if hasattr(d, k):
-                return getattr(d, k)
-        return default
-
-    cve_cliente = gv(detalle, "cve_cliente", "id", "cliente")
-
-    # --------- Controles ----------
-    tf_nombre = ft.TextField(label="Nombre", value=str(gv(detalle, "nombre")), expand=True)
-    tf_paterno = ft.TextField(label="Apellido paterno", value=str(gv(detalle, "paterno", "apellido_paterno")), expand=True)
-    tf_materno = ft.TextField(label="Apellido materno", value=str(gv(detalle, "materno", "apellido_materno")), expand=True)
-    tf_correo  = ft.TextField(label="Correo", value=str(gv(detalle, "correo", "email")), expand=True)
-    tf_tel     = ft.TextField(label="Teléfono (10 dígitos o +52...)", value=str(gv(detalle, "telefono", "tel")), expand=True)
-
-    tf_calle   = ft.TextField(label="Calle", value=str(gv(detalle, "calle", "dir_calle")), expand=True)
-    tf_numero  = ft.TextField(label="Número", value=str(gv(detalle, "numero", "dir_numero")), expand=True)
-    tf_cp      = ft.TextField(label="CP (máx 5 dígitos)", value=str(gv(detalle, "cp", "codigo_postal")), expand=True)
-    tf_colonia = ft.TextField(label="Colonia", value=str(gv(detalle, "colonia", "dir_colonia")), expand=True)
-    tf_mpio    = ft.TextField(label="Municipio", value=str(gv(detalle, "municipio")), expand=True)
-
-    # País/Estado como catálogos (con "Otro")
-    paises = db_instance.paises() or {}
-    dd_pais = ft.Dropdown(
-        label="País",
-        options=[ft.dropdown.Option(text=nombre, key=paises[nombre]) for nombre in paises.keys()],
-        expand=True,
+    # Mensaje pequeño para depuración (opcional: comenta si no lo quieres)
+    info_precarga = ft.Text(
+        value="(precargado)" if any([tf_nombre.value, tf_pat.value, tf_correo.value]) else "(sin datos del cliente)",
+        color=ft.colors.GREY,
+        size=11,
+        italic=True,
     )
-    # selecciona país si venía algo
-    pais_actual = gv(detalle, "pais")
-    if str(pais_actual).strip().isdigit():
-        dd_pais.value = int(pais_actual)
-    else:
-        # buscar por nombre
-        inv = {str(k).strip().lower(): v for k, v in paises.items()}
-        dd_pais.value = inv.get(str(pais_actual).strip().lower())
 
-    dd_estado = ft.Dropdown(label="Estado", expand=True, disabled=True)
-    tf_estado_otro = ft.TextField(label="Otro estado", visible=False, expand=True)
-
-    def _cargar_estados(e=None):
-        dd_estado.disabled = True
-        dd_estado.options = []
-        tf_estado_otro.visible = False
-        if dd_pais.value:
-            try:
-                ests = db_instance.estados(dd_pais.value) or {}
-                dd_estado.options = [ft.dropdown.Option(text=n, key=ests[n]) for n in ests.keys()]
-                dd_estado.options.insert(0, ft.dropdown.Option("Otro"))
-                dd_estado.disabled = False
-            except Exception:
-                pass
-        page.update()
-
-    def _estado_cambio(e=None):
-        tf_estado_otro.visible = (dd_estado.value == "Otro")
-        page.update()
-
-    dd_pais.on_change = _cargar_estados
-    dd_estado.on_change = _estado_cambio
-    _cargar_estados()
-
-    # intenta seleccionar estado actual
-    estado_actual = gv(detalle, "estado")
-    if str(estado_actual).strip().isdigit():
-        dd_estado.value = int(estado_actual)
-    elif estado_actual:
-        # por nombre
-        try:
-            ests = db_instance.estados(dd_pais.value) or {}
-            inv = {str(k).strip().lower(): v for k, v in ests.items()}
-            dd_estado.value = inv.get(str(estado_actual).strip().lower())
-            if dd_estado.value is None:
-                dd_estado.value = "Otro"
-                tf_estado_otro.value = str(estado_actual)
-                tf_estado_otro.visible = True
-        except Exception:
-            pass
-
-    error_lbl = ft.Text("", color=ft.colors.RED_300)
-
-    # --------- Validaciones live ----------
-    def _cp_live(e=None):
-        tf_cp.value = "".join(ch for ch in (tf_cp.value or "") if ch.isdigit())[:5]
-        page.update()
-
-    def _num_live(e=None):
-        tf_numero.value = _normalize_house(tf_numero.value)
-        ok = bool(tf_numero.value and HOUSE_RE.match(tf_numero.value))
-        tf_numero.error_text = None if ok else "1–6 dígitos, opcional letra o 'S/N'"
-        page.update()
-
-    tf_cp.on_change = _cp_live
-    tf_numero.on_change = _num_live
-
-    # --------- Acciones ----------
-    dlg = ft.AlertDialog(modal=True)
+    error = ft.Text("", color=ft.colors.RED_300)
 
     def cerrar(_=None):
-        dlg.open = False
+        page.dialog.open = False
         page.update()
 
     def guardar(_=None):
-        error_lbl.value = ""
-        page.update()
+        # Colecta valores
+        nombre   = (tf_nombre.value or "").strip()
+        paterno  = (tf_pat.value or "").strip()
+        materno  = (tf_mat.value or "").strip()
+        correo   = (tf_correo.value or "").strip()
+        telefono = (tf_tel.value or "").strip()
+        calle    = (tf_calle.value or "").strip()
+        numero   = (tf_numero.value or "").strip()
 
-        # mínimos obligatorios
-        oblig = [tf_nombre.value, tf_paterno.value, tf_correo.value, tf_tel.value,
-                 tf_calle.value, tf_numero.value, tf_cp.value, tf_colonia.value,
-                 tf_mpio.value, dd_pais.value]
-        if not all(oblig):
-            error_lbl.value = "Complete los campos obligatorios."
+        if not nombre or not paterno or not correo:
+            error.value = "Nombre, Ap. Paterno y Correo son obligatorios."
             page.update()
             return
 
-        # correo / teléfono / número / cp
-        if not EMAIL_RE.match((tf_correo.value or "").strip()):
-            error_lbl.value = "Correo no válido."
-            page.update(); return
+        # 1) Intentar una actualización directa (si existe en la fachada)
+        ok, _res, used = _call_first_if_present(
+            db_instance,
+            ["actualizar_cliente", "update_cliente", "editar_cliente", "cliente_update", "cliente_actualizar", "update"],
+            cve_cliente=_get(cliente_obj, ["cve_cliente", "id", "cliente"]),
+            nombre=nombre, paterno=paterno, materno=materno,
+            correo=correo, telefono=telefono,
+            calle=calle, num_calle=numero,
+        )
 
-        tel_norm = _normalize_phone(tf_tel.value)
-        if not tel_norm:
-            error_lbl.value = "Teléfono inválido: 10 dígitos o +52 y 10 dígitos."
-            page.update(); return
-
-        num_ok = HOUSE_RE.match(_normalize_house(tf_numero.value))
-        if not num_ok:
-            error_lbl.value = "Número inválido (1–6 dígitos, opcional letra o 'S/N')."
-            page.update(); return
-
-        cp = "".join(ch for ch in (tf_cp.value or "") if ch.isdigit())[:5]
-        if not cp:
-            error_lbl.value = "Capture al menos 1 dígito de CP (máx. 5)."
-            page.update(); return
-
-        # estado final
-        est_final = tf_estado_otro.value.strip() if dd_estado.value == "Otro" else dd_estado.value
-        if not est_final:
-            error_lbl.value = "Seleccione un estado o escriba uno."
-            page.update(); return
-
-        # resolver/crear colonia (si tu backend necesita id)
-        colonia_val = tf_colonia.value.strip()
-        try:
-            cid = db_instance.resolve_or_create_colonia(
-                cp=cp, nombre=colonia_val, municipio=tf_mpio.value.strip(), estado=est_final
-            )
-            if cid:
-                colonia_val = int(cid)
-        except Exception:
-            pass  # si no se puede, se manda el texto
-
-        try:
-            db_instance.actualizar_cliente(
-                cve_cliente=cve_cliente,
-                nombre=tf_nombre.value.strip(),
-                paterno=tf_paterno.value.strip(),
-                materno=tf_materno.value.strip(),
-                correo=tf_correo.value.strip(),
-                telefono=tel_norm,
-                calle=tf_calle.value.strip(),
-                numero=_normalize_house(tf_numero.value),
-                cp=cp,
-                colonia=colonia_val,
-                municipio=tf_mpio.value.strip(),
-                estado=est_final,
-                pais=dd_pais.value,
-            )
+        # 2) Si no hay método directo, usa el helper de la fachada que sabe vincular por orden
+        if not ok:
             try:
-                db_instance.get_connection().commit()
+                db_instance.guardar_cliente_de_orden(
+                    cve_orden_int,
+                    nombre=nombre, paterno=paterno, materno=materno,
+                    correo=correo, telefono=telefono,
+                    calle=calle, num_calle=numero
+                )
+                ok = True
+            except Exception:
+                ok = False
+
+        if ok:
+            # commit suave
+            try:
+                if hasattr(db_instance, "get_connection"):
+                    conn = db_instance.get_connection()
+                    if conn:
+                        conn.commit()
             except Exception:
                 pass
 
             page.open(ft.SnackBar(ft.Text("Cliente actualizado")))
-            if callable(on_saved):
-                try: on_saved()
-                except Exception: pass
             cerrar()
-
-        except Exception as ex:
-            try:
-                db_instance.get_connection().rollback()
-            except Exception:
-                pass
-            error_lbl.value = f"Error al actualizar: {ex}"
+            if callable(on_saved):
+                try:
+                    on_saved()
+                except Exception:
+                    pass
+        else:
+            error.value = "No se pudo actualizar el cliente (verifica la fachada/controlador)."
             page.update()
 
-    dlg.title = ft.Text("Editar cliente", weight=ft.FontWeight.BOLD)
-    dlg.content = ft.Container(
+    dlg = ft.AlertDialog(
+        modal=True,
+        title=ft.Text(f"Editar Cliente – Orden #{cve_orden}"),
         content=ft.Column(
-            [
-                error_lbl,
-                ft.Row([tf_nombre, tf_paterno, tf_materno]),
-                ft.Row([tf_correo, tf_tel]),
-                ft.Row([tf_calle, tf_numero, tf_cp]),
-                ft.Row([tf_colonia, tf_mpio]),
-                ft.Row([dd_pais, dd_estado, tf_estado_otro]),
+            controls=[
+                info_precarga,
+                tf_nombre, tf_pat, tf_mat, tf_correo, tf_tel, tf_calle, tf_numero,
+                ft.Container(height=4),
+                error,
             ],
-            tight=True, spacing=8
+            tight=True,
+            scroll=ft.ScrollMode.AUTO,
         ),
-        width=720,
+        actions=[
+            ft.TextButton("Guardar", on_click=guardar),
+            ft.TextButton("Cancelar", on_click=cerrar),
+        ],
+        actions_alignment=ft.MainAxisAlignment.END,
+        shape=ft.RoundedRectangleBorder(radius=18),
     )
-    dlg.actions = [
-        ft.TextButton("Cancelar", on_click=cerrar),
-        ft.FilledButton("Guardar", icon=ft.icons.SAVE, on_click=guardar),
-    ]
 
     page.dialog = dlg
     dlg.open = True

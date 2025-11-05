@@ -8,6 +8,15 @@ if not hasattr(ft, "colors") and hasattr(ft, "Colors"):
 if not hasattr(ft, "icons") and hasattr(ft, "Icons"):
     ft.icons = ft.Icons
 
+# Import del diálogo de cliente (ajusta la ruta si lo tienes en otro lado)
+try:
+    from view.cliente import open_editar_cliente_dialog
+except Exception:
+    try:
+        from cliente import open_editar_cliente_dialog  # mismo dir
+    except Exception:
+        open_editar_cliente_dialog = None  # para evitar crash si falta
+
 
 # ------------------------- Helpers -------------------------
 def _call_first_if_present(target, names: list[str], *args, **kwargs):
@@ -73,6 +82,7 @@ def _tipo_text(v) -> str:
     Esperado: {id: (tarifa, nombre)} o {id: {"descripcion": "...", "nombre": "..."}}
     """
     if isinstance(v, (list, tuple)):
+        # cuando viene de DBFacade.tipos(): (tarifa, nombre)
         return str(v[1] if len(v) > 1 else v[0])
     if isinstance(v, dict):
         return str(v.get("descripcion") or v.get("nombre") or v.get("tipo") or "")
@@ -225,8 +235,10 @@ def open_editar_orden_dialog(
             except Exception:
                 conn = None
         if conn:
-            try: conn.commit()
-            except Exception: pass
+            try:
+                conn.commit()
+            except Exception:
+                pass
 
     def _rollback_safely():
         conn = connection
@@ -236,8 +248,10 @@ def open_editar_orden_dialog(
             except Exception:
                 conn = None
         if conn:
-            try: conn.rollback()
-            except Exception: pass
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
     def guardar(_=None):
         error_lbl.value = ""
@@ -307,9 +321,109 @@ def open_editar_orden_dialog(
             ft.FilledButton("Guardar", icon=ft.icons.SAVE, on_click=guardar),
         ],
         actions_alignment=ft.MainAxisAlignment.END,
-        shape=ft.RoundedRectangleBorder(radius=18),
+        shape=ft.RoundedRectangleBorder(radius=18),  # ← corregido (antes Rxounded)
     )
 
     page.dialog = dlg
     dlg.open = True
     page.update()
+
+
+# --------------------- Vista de Órdenes + Editar Cliente ----------------------
+def open_ordenes_page(page: ft.Page, db_instance):
+    """
+    Lista de órdenes con botón para 'Editar cliente' (precargado)
+    y botón para 'Editar orden'.
+    """
+    tabla = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True)
+
+    def gv(o, *keys, default=None):
+        if isinstance(o, dict):
+            for k in keys:
+                if k in o:
+                    return o[k]
+        for k in keys:
+            if hasattr(o, k):
+                return getattr(o, k)
+        return default
+
+    def recargar_tabla(_=None):
+        tabla.controls.clear()
+        try:
+            ordenes = db_instance.ordenes() or []
+        except Exception:
+            ordenes = []
+
+        for o in ordenes:
+            cve_orden = gv(o, "cve_orden", "orden", "id")
+            status    = gv(o, "status", "estatus", default="")
+            tecnico   = gv(o, "tecnico", "empleado", default="")
+            cliente   = gv(o, "cliente", "nombre_cliente", default="")
+            modelo    = gv(o, "eq_modelo", "modelo", default="")
+            marca     = gv(o, "eq_marca", "marca", default="")
+
+            btn_editar_cliente = ft.IconButton(
+                icon=ft.icons.PERSON,
+                tooltip="Editar cliente (precargado)",
+                on_click=lambda e, orden=o: _editar_cliente_desde_orden(orden),
+            )
+            btn_editar_orden = ft.IconButton(
+                icon=ft.icons.EDIT,
+                tooltip="Editar orden",
+                on_click=lambda e, orden=o: open_editar_orden_dialog(page, db_instance, orden, on_saved=recargar_tabla),
+            )
+
+            fila = ft.Row(
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                controls=[
+                    ft.Text(f"#{cve_orden}", width=80),
+                    ft.Text(str(status), width=120),
+                    ft.Text(str(tecnico), width=200),
+                    ft.Text(str(cliente), width=220),
+                    ft.Text(str(marca), width=160),
+                    ft.Text(str(modelo), width=160),
+                    ft.Row([btn_editar_cliente, btn_editar_orden]),
+                ],
+            )
+            tabla.controls.append(fila)
+
+        page.update()
+
+    def _editar_cliente_desde_orden(orden_obj):
+        if open_editar_cliente_dialog is None:
+            page.open(ft.SnackBar(ft.Text("No se pudo cargar el diálogo de cliente (import).")))
+            return
+
+        cve_orden = gv(orden_obj, "cve_orden", "orden", "id")
+        if not cve_orden:
+            page.open(ft.SnackBar(ft.Text("No se pudo identificar la orden.")))
+            return
+
+        try:
+            cve_cliente = db_instance.cliente_id_por_orden(int(cve_orden))
+        except Exception:
+            cve_cliente = None
+
+        if not cve_cliente:
+            page.open(ft.SnackBar(ft.Text("La orden no tiene cliente ligado.")))
+            return
+
+        try:
+            cliente_det = db_instance.cliente_detalle(int(cve_cliente)) or {}
+        except Exception:
+            cliente_det = {}
+
+        open_editar_cliente_dialog(page, db_instance, cliente_det, cve_orden, on_saved=recargar_tabla)
+
+    # Render
+    page.controls.clear()
+    page.add(
+        ft.Column(
+            controls=[
+                ft.Text("Órdenes", size=22, weight=ft.FontWeight.BOLD),
+                tabla,
+            ],
+            expand=True,
+        )
+    )
+    recargar_tabla()
