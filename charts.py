@@ -5,7 +5,7 @@ from typing import Callable, Dict
 
 
 def _count_statuses(db_instance, ui_status_name_fn: Callable[[int | str | None], str]) -> Dict[str, int]:
-    """Cuenta órdenes por estatus usando el nombre UI normalizado."""
+    """Cuenta órdenes por estatus (En proceso, Terminado, Recogido) usando el nombre UI normalizado."""
     try:
         ordenes = db_instance.ordenes() or []
     except Exception:
@@ -19,29 +19,12 @@ def _count_statuses(db_instance, ui_status_name_fn: Callable[[int | str | None],
     return counts
 
 
-def _bottom_axis(labels: dict[str, str]) -> ft.ChartAxis:
-    return ft.ChartAxis(
-        labels=[
-            ft.ChartAxisLabel(value=0, label=ft.Container(ft.Text(labels["En proceso"], size=12))),
-            ft.ChartAxisLabel(value=1, label=ft.Container(ft.Text(labels["Terminado"], size=12))),
-            ft.ChartAxisLabel(value=2, label=ft.Container(ft.Text(labels["Recogido"], size=12))),
-        ]
-    )
-
-
 def open_status_chart_dialog(page: ft.Page, db_instance, ui_status_name_fn: Callable[[int | str | None], str]) -> None:
-    """Gráfica de barras por estatus sin tooltips (evita comillas escapadas)."""
+    """Muestra un diálogo con una gráfica de barras por estatus de órdenes."""
     counts = _count_statuses(db_instance, ui_status_name_fn)
 
-    labels_ui = {
-        "En proceso": "En proceso",
-        "Terminado": "Terminado",
-        "Recogido": "Recogido" if counts["Recogido"] == 1 else "Recogidos",
-    }
-
-    max_y = max(counts.values()) if counts else 0
-    max_y = (max_y + 1) if max_y > 0 else 1
-
+    # Intentamos crear la gráfica con la API moderna de Flet.
+    # Si falla (versiones antiguas), mostramos un fallback de texto.
     try:
         chart = ft.BarChart(
             bar_groups=[
@@ -52,7 +35,7 @@ def open_status_chart_dialog(page: ft.Page, db_instance, ui_status_name_fn: Call
                             from_y=0,
                             to_y=float(counts["En proceso"]),
                             color=ft.colors.DEEP_PURPLE,
-                            tooltip=None,  # ← desactivado para evitar comillas
+                            tooltip=f"En proceso: {counts['En proceso']}",
                         )
                     ],
                 ),
@@ -63,7 +46,7 @@ def open_status_chart_dialog(page: ft.Page, db_instance, ui_status_name_fn: Call
                             from_y=0,
                             to_y=float(counts["Terminado"]),
                             color=ft.colors.GREEN,
-                            tooltip=None,  # ← desactivado
+                            tooltip=f"Terminado: {counts['Terminado']}",
                         )
                     ],
                 ),
@@ -74,26 +57,26 @@ def open_status_chart_dialog(page: ft.Page, db_instance, ui_status_name_fn: Call
                             from_y=0,
                             to_y=float(counts["Recogido"]),
                             color=ft.colors.AMBER_900,
-                            tooltip=None,  # ← desactivado
+                            tooltip=f"Recogido: {counts['Recogido']}",
                         )
                     ],
                 ),
             ],
-            bottom_axis=_bottom_axis(labels_ui),
-            max_y=max_y,
+            # Opcionales; si tu versión no los soporta, puedes comentarlos.
+            # border=ft.border.all(1, ft.colors.GREY_300),
+            # animate=200,
         )
 
-        # Leyenda con conteos (reemplaza a los tooltips)
         legend = ft.Row(
             [
                 ft.Container(width=14, height=14, bgcolor=ft.colors.DEEP_PURPLE, border_radius=3),
-                ft.Text(f"{labels_ui['En proceso']}: {counts['En proceso']}"),
-                ft.Container(width=16),
+                ft.Text("En proceso"),
+                ft.Container(width=10),
                 ft.Container(width=14, height=14, bgcolor=ft.colors.GREEN, border_radius=3),
-                ft.Text(f"{labels_ui['Terminado']}: {counts['Terminado']}"),
-                ft.Container(width=16),
+                ft.Text("Terminado"),
+                ft.Container(width=10),
                 ft.Container(width=14, height=14, bgcolor=ft.colors.AMBER_900, border_radius=3),
-                ft.Text(f"{labels_ui['Recogido']}: {counts['Recogido']}"),
+                ft.Text("Recogido"),
             ],
             alignment=ft.MainAxisAlignment.CENTER,
             spacing=8,
@@ -113,18 +96,22 @@ def open_status_chart_dialog(page: ft.Page, db_instance, ui_status_name_fn: Call
         )
 
     except Exception as ex:
-        # Fallback de texto
+        # Fallback seguro si tu versión de Flet no soporta BarChart
         content = ft.Container(
             width=480,
             content=ft.Column(
                 [
                     ft.Text("Órdenes por estatus", size=18, weight=ft.FontWeight.BOLD),
-                    ft.Text(f"{labels_ui['En proceso']}: {counts['En proceso']}"),
-                    ft.Text(f"{labels_ui['Terminado']}: {counts['Terminado']}"),
-                    ft.Text(f"{labels_ui['Recogido']}: {counts['Recogido']}"),
+                    ft.Text(f"En proceso: {counts['En proceso']}"),
+                    ft.Text(f"Terminado: {counts['Terminado']}"),
+                    ft.Text(f"Recogido: {counts['Recogido']}"),
                     ft.Container(height=10),
-                    ft.Text(f"(Vista simplificada por compatibilidad: {ex})",
-                           size=12, italic=True, color=ft.colors.GREY),
+                    ft.Text(
+                        f"(Vista simplificada por compatibilidad: {ex})",
+                        size=12,
+                        italic=True,
+                        color=ft.colors.GREY,
+                    ),
                 ],
                 tight=True,
             ),

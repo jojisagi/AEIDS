@@ -2,6 +2,7 @@
 import flet as ft
 from .login import build_login_view
 from .chat_fab import make_chat_fab  # FAB (se desactiva si no hay API key)
+from .chat_fab import ChatbotFAB
 
 def main(page: ft.Page):
     page.title = "App Órdenes — Módulos"
